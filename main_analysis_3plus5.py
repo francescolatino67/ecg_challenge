@@ -724,7 +724,7 @@ class ECG2DDataset(Dataset):
       - etichette sport_ability
     """
 
-    def __init__(self, signals, labels):
+    def __init__(self, tabular, signals, labels):
         """
         Parameters
         ----------
@@ -732,12 +732,15 @@ class ECG2DDataset(Dataset):
             (N, T, 12)
         labels : pd.Series
             etichette 0/1
+        tabular : pd.DataFrame
+            Feature tabellari
         """
         # signals: (N, T, 12) -> (N, 1, 12, T)
         sig = np.transpose(signals, (0, 2, 1))  # (N, 12, T)
         sig = np.expand_dims(sig, axis=1)       # (N, 1, 12, T)
         self.signals = torch.tensor(sig, dtype=torch.float32)
         self.labels  = torch.tensor(labels.values, dtype=torch.float32).unsqueeze(1)
+        self.tabular = torch.tensor(tabular.values, dtype=torch.float32)
 
     def __len__(self):
         return len(self.labels)
@@ -745,7 +748,8 @@ class ECG2DDataset(Dataset):
     def __getitem__(self, idx):
         sig = self.signals[idx]
         lab = self.labels[idx]
-        return sig, lab
+        tab = self.tabular[idx]
+        return tab, sig, lab
 
 ###############################################
 # ARCHITETTURA DEL MODELLO
@@ -801,31 +805,51 @@ class ECG2DBackbone(nn.Module):
         return x
 
 
-class ECG2DModel3(nn.Module):
+class TabularBranch(nn.Module):
     """
-    Opzione 3: SOLO ECG 2D, senza tabellare.
+    Ramo MLP per feature tabellari.
+    """
 
-    Input:  immagini ECG (B, 1, 12, T)
+    def __init__(self, in_features, hidden_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, 32),
+            nn.GELU(),
+            nn.Linear(32, hidden_dim),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.net(x)  # (B, hidden_dim)
+
+
+class ECG2DModel3Plus5(nn.Module):
+    """
+    Opzione 3+5: ECG 2D + Tabellare.
+
+    Input:
+      - tab: (B, F_tab)
+      - ecg: (B, 1, 12, T)
     Output: probabilità sport_ability
     """
 
-    def __init__(self, ecg_out_dim=256, dropout=0.3):
+    def __init__(self, tab_in_features, ecg_out_dim=256, tab_hidden=32, dropout=0.3):
         super().__init__()
 
         self.ecg_backbone = ECG2DBackbone(out_dim=ecg_out_dim)
+        
+        # Branch tabellare
+        self.tab_branch = TabularBranch(in_features=tab_in_features, hidden_dim=tab_hidden)
+
+        # Dimensioni fusione
+        fusion_dim = ecg_out_dim + tab_hidden
 
         self.classifier = nn.Sequential(
-            nn.Linear(ecg_out_dim, 128),
+            nn.Linear(fusion_dim, 128),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(128, 1)
         )
-
-    def forward(self, ecg_img):
-        ecg_emb = self.ecg_backbone(ecg_img)  # (B, ecg_out_dim)
-        logits = self.classifier(ecg_emb)
-        prob = torch.sigmoid(logits)
-        return prob
 
     def forward(self, tab, ecg):
         """
