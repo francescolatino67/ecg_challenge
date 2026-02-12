@@ -442,6 +442,8 @@ tabular_data = pd.concat([
 ], ignore_index=True)
 tabular_data_balanced, removed_ids = balance_dataset(tabular_data, target_col='sport_ability', id_col='ECG_patient_id', random_state=42)
 
+tabular_data_balanced = preprocess_data(tabular_data_balanced)
+
 # --- Load and filter both batches ---
 ECGs_1 = [f for f in os.listdir(DATA_Batch_01) if f.endswith(".mat") and int(f.split(".")[0]) not in removed_ids]
 ECGs_2 = [f for f in os.listdir(DATA_Batch_02) if f.endswith(".mat") and int(f.split(".")[0]) not in removed_ids]
@@ -959,14 +961,15 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
 
         # Seleziona le colonne che vuoi usare come feature tabellari
         # In questo esempio uso: age_at_exam, height, weight, trainning_load, sex, sport_classification
-        feature_cols = ["age_at_exam", "height", "weight", "trainning_load", "sex", "sport_classification"]
+        feature_cols = tabular_data.columns.difference(["ECG_patient_id", "sport_ability"])
+        print(feature_cols)
         X_train_final = X_train[feature_cols].copy()
         X_test_final  = X_test[feature_cols].copy()
 
         # Pulizia semplice su age_at_exam e trainning_load (come nel notebook)
         for df in [X_train_final, X_test_final]:
             df["age_at_exam"] = df["age_at_exam"].apply(lambda x: x if 0.0 <= x <= 100.0 else np.nan)
-            df["trainning_load"] = df["trainning_load"].apply(lambda x: x if 0 < x <= 4 else np.nan)
+            # df["trainning_load"] = df["trainning_load"].apply(lambda x: x if 0 < x <= 4 else np.nan)
 
         # Imputazione dei NaN (IterativeImputer)
         imputer = IterativeImputer(random_state=42)
@@ -974,8 +977,8 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
         X_test_imputed  = pd.DataFrame(imputer.transform(X_test_final), columns=feature_cols)
 
         # Definisco quali colonne sono numeriche e quali "categoriche"
-        numeric_cols = ["age_at_exam", "height", "weight", "trainning_load"]
-        categorical_cols = ["sex", "sport_classification"]
+        numeric_cols = ["age_at_exam", "height", "weight"]
+        categorical_cols = [col for col in feature_cols if col not in numeric_cols]        
 
         # Scaling sulle numeriche
         scaler = StandardScaler()
