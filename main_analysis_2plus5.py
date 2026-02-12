@@ -756,36 +756,33 @@ class ECGDataset(Dataset):
 
 class ECGBackbone(nn.Module):
     """
-    Backbone per il segnale ECG:
-      - CNN 1D su 12 derivazioni
-      - GRU bidirezionale per catturare la dinamica temporale
-    Output: embedding vettoriale per ogni paziente
+    Backbone per un gruppo di lead (es. 6 limb o 6 precordial):
+      - 3 blocchi Conv1D + BatchNorm + GELU + MaxPool
+      - GRU bidirezionale sul tempo
     """
 
-    def __init__(self, in_channels=12, hidden_size=128):
+    def __init__(self, in_channels=6, hidden_size=64):
         super().__init__()
 
-        # Blocco di convoluzioni 1D + pooling
         self.conv_block = nn.Sequential(
             nn.Conv1d(in_channels, 32, kernel_size=7, padding=3),
             nn.BatchNorm1d(32),
             nn.GELU(),
-            nn.MaxPool1d(2),  # T -> T/2
+            nn.MaxPool1d(2),
 
             nn.Conv1d(32, 64, kernel_size=7, padding=3),
             nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.MaxPool1d(2),  # T -> T/4
+            nn.MaxPool1d(2),
 
-            nn.Conv1d(64, 128, kernel_size=7, padding=3),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(64, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
             nn.GELU(),
-            nn.MaxPool1d(2),  # T -> T/8
+            nn.MaxPool1d(2),
         )
 
-        # GRU bidirezionale sul tempo
         self.gru = nn.GRU(
-            input_size=128,
+            input_size=64,
             hidden_size=hidden_size,
             num_layers=1,
             batch_first=True,
@@ -794,39 +791,23 @@ class ECGBackbone(nn.Module):
 
     def forward(self, x):
         """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Shape (B, 12, T_segment)
-
-        Returns
-        -------
-        h_flat : torch.Tensor
-            Shape (B, 2*hidden_size)
+        x: (B, 6, T_segment)
+        return: (B, 2*hidden_size)
         """
-        # CNN 1D
-        x = self.conv_block(x)   # (B, 128, T')
-        # Permuta a (B, T', C) per la GRU
-        x = x.permute(0, 2, 1)   # (B, T', 128)
-
-        # GRU
-        # output: (B, T', 2*hidden_size)
-        # h: (num_layers*2, B, hidden_size) -> ultima hidden state per direzione
-        _, h = self.gru(x)
-
-        # h ha shape (2, B, hidden_size) dato num_layers=1, bidirectional=True
+        x = self.conv_block(x)     # (B, 64, T')
+        x = x.permute(0, 2, 1)     # (B, T', 64)
+        _, h = self.gru(x)         # h: (2, B, hidden_size)
         h = h.permute(1, 0, 2).reshape(x.size(0), -1)  # (B, 2*hidden_size)
         return h
 
 
 class TabularBranch(nn.Module):
     """
-    Ramo MLP per le feature tabellari.
+    Ramo MLP per feature tabellari.
     """
 
     def __init__(self, in_features, hidden_dim=32):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(in_features, 32),
             nn.GELU(),
@@ -835,29 +816,38 @@ class TabularBranch(nn.Module):
         )
 
     def forward(self, x):
-        """
-        x: (B, in_features)
-        return: (B, hidden_dim)
-        """
-        return self.net(x)
+        return self.net(x)  # (B, hidden_dim)
 
 
-class ECGSportAbilityModel(nn.Module):
+class ECGSportAbilityMultiBranchModel(nn.Module):
     """
-    Modello multimodale:
-      - ECGBackbone: embedding ECG (2*ecg_hidden)
-      - TabularBranch: embedding tabellare (tab_hidden)
-      - Classifier: MLP finale che concatena le due embedding
-    Output: probabilità di sport_ability = 1
+    Architettura 2+5:
+
+    - 2 : due branch ECGBackbone
+          * branch 1: limb leads (I, II, III, aVR, aVL, aVF) -> 6 canali
+          * branch 2: precordial leads (V1–V6)                -> 6 canali
+
+    - 5 : branch MLP per dati tabellari (TabularBranch)
+
+    Fusione:
+      [emb_limb, emb_precordial, emb_tabular] -> classifier -> probabilità sport_ability
     """
 
-    def __init__(self, tab_in_features, ecg_hidden=128, tab_hidden=32, dropout=0.3):
+    def __init__(self, tab_in_features,
+                 ecg_hidden=64, tab_hidden=32, dropout=0.3):
         super().__init__()
 
-        self.ecg_backbone = ECGBackbone(in_channels=12, hidden_size=ecg_hidden)
-        self.tab_branch   = TabularBranch(in_features=tab_in_features, hidden_dim=tab_hidden)
+        # Due backbone distinti con stessi iperparametri ma pesi diversi
+        self.limb_backbone = ECGBackbone(in_channels=6, hidden_size=ecg_hidden)
+        self.precordial_backbone = ECGBackbone(in_channels=6, hidden_size=ecg_hidden)
 
-        fusion_dim = 2 * ecg_hidden + tab_hidden
+        # Branch tabellare
+        self.tab_branch = TabularBranch(in_features=tab_in_features,
+                                        hidden_dim=tab_hidden)
+
+        # Ogni backbone -> (B, 2*ecg_hidden)
+        # Due backbone + ramo tabellare
+        fusion_dim = (2 * ecg_hidden) * 2 + tab_hidden
 
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, 128),
@@ -868,24 +858,24 @@ class ECGSportAbilityModel(nn.Module):
 
     def forward(self, tab, ecg):
         """
-        Parameters
-        ----------
-        tab : torch.Tensor
-            Feature tabellari, shape (B, F_tab)
-        ecg : torch.Tensor
-            Segmenti ECG, shape (B, 12, T)
+        tab : (B, F_tab)
+        ecg : (B, 12, T)
 
-        Returns
-        -------
-        prob : torch.Tensor
-            Probabilità di classe positiva (B, 1)
+        Si assume l'ordine delle derivazioni:
+        [I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6]
         """
-        ecg_emb = self.ecg_backbone(ecg)      # (B, 2*ecg_hidden)
-        tab_emb = self.tab_branch(tab)        # (B, tab_hidden)
 
-        x = torch.cat([ecg_emb, tab_emb], dim=1)  # (B, fusion_dim)
-        logits = self.classifier(x)               # (B, 1)
-        prob = torch.sigmoid(logits)              # Sigmoid per avere probabilità
+        # Split 12 canali -> 6 limb + 6 precordial
+        limb = ecg[:, 0:6, :]     # (B, 6, T)
+        precordial = ecg[:, 6:12, :]  # (B, 6, T)
+
+        limb_emb = self.limb_backbone(limb)           # (B, 2*ecg_hidden)
+        prec_emb = self.precordial_backbone(precordial)  # (B, 2*ecg_hidden)
+        tab_emb  = self.tab_branch(tab)               # (B, tab_hidden)
+
+        x = torch.cat([limb_emb, prec_emb, tab_emb], dim=1)
+        logits = self.classifier(x)
+        prob = torch.sigmoid(logits)
         return prob
 
 
@@ -893,7 +883,7 @@ class ECGSportAbilityModel(nn.Module):
 # TRAINING + CROSS-VALIDATION
 ###############################################
 
-def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_splits=10, threshold=0.5):
+def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_splits=5, threshold=0.5):
     """
     Esegue cross-validation stratificata sul target 'sport_ability'
     usando il modello ECGSportAbilityModel.
@@ -999,21 +989,24 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
             [X_test_imputed[numeric_cols], X_test_imputed[categorical_cols]], axis=1
         )
 
-        # Creo Dataset e DataLoader
+         # Dataset / DataLoader
         train_dataset = ECGDataset(train_final_df, ecg_train_segments, Y_train)
         test_dataset  = ECGDataset(test_final_df,  ecg_test_segments,  Y_test)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
-        # Inizializzo il modello per questo fold
-        tab_in_features = train_final_df.shape[1]  # numero di colonne tabellari
-        model = ECGSportAbilityModel(tab_in_features=tab_in_features).to(device)
+        # Modello
+        tab_in_features = train_final_df.shape[1]
+        model = ECGSportAbilityMultiBranchModel(
+            tab_in_features=tab_in_features,
+            ecg_hidden=64,
+            tab_hidden=32,
+            dropout=0.3
+        ).to(device)
 
-        # Uso BCE con probabilità (il modello ha già la sigmoid)
         criterion = nn.BCELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
         # Per salvare metriche per epoca (dentro il singolo fold)
         f1_list_single_fold = []
         f1_list_single_fold_train = []

@@ -716,155 +716,116 @@ def segment_ecg(signals, segment_length=2500, start_mode="begin"):
 # DATASET PYTORCH
 ###############################################
 
-class ECGDataset(Dataset):
+class ECG2DDataset(Dataset):
     """
-    Dataset PyTorch per combinare:
-      - feature tabellari
-      - segmenti ECG
-      - etichette (sport_ability)
+    Dataset PyTorch per il modello opzione 3 (solo ECG 2D):
+
+      - segmenti ECG come “immagine” 2D: (1, 12, T_segment)
+      - etichette sport_ability
     """
 
-    def __init__(self, tabular_df, signals, labels):
+    def __init__(self, signals, labels):
         """
         Parameters
         ----------
-        tabular_df : pd.DataFrame
-            DataFrame con le feature tabellari selezionate.
         signals : np.ndarray
-            Array numpy con i segmenti ECG (N, T, 12).
+            (N, T, 12)
         labels : pd.Series
-            Serie con le etichette binarie (0/1).
+            etichette 0/1
         """
-        # signals: (N, T, 12) -> PyTorch vuole (N, C, T)
-        self.signals = torch.tensor(signals, dtype=torch.float32).permute(0, 2, 1)
+        # signals: (N, T, 12) -> (N, 1, 12, T)
+        sig = np.transpose(signals, (0, 2, 1))  # (N, 12, T)
+        sig = np.expand_dims(sig, axis=1)       # (N, 1, 12, T)
+        self.signals = torch.tensor(sig, dtype=torch.float32)
         self.labels  = torch.tensor(labels.values, dtype=torch.float32).unsqueeze(1)
-        self.tabular = torch.tensor(tabular_df.values, dtype=torch.float32)
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        tab = self.tabular[idx]
         sig = self.signals[idx]
         lab = self.labels[idx]
-        return tab, sig, lab
-
+        return sig, lab
 
 ###############################################
 # ARCHITETTURA DEL MODELLO
 ###############################################
 
-class ECGBackbone(nn.Module):
+class ECG2DBackbone(nn.Module):
     """
-    Backbone per il segnale ECG:
-      - CNN 1D su 12 derivazioni
-      - GRU bidirezionale per catturare la dinamica temporale
-    Output: embedding vettoriale per ogni paziente
+    Backbone 2D per ECG visto come immagine (1, 12, T_segment).
+
+    Input:  (B, 1, 12, T)
+    Output: embedding (B, feat_dim)
     """
 
-    def __init__(self, in_channels=12, hidden_size=128):
+    def __init__(self, out_dim=256):
         super().__init__()
 
-        # Blocco di convoluzioni 1D + pooling
-        self.conv_block = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, padding=3),
-            nn.BatchNorm1d(32),
+        # CNN 2D: riduciamo progressivamente tempo e lead
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(1, 16, kernel_size=(3, 7), padding=(1, 3)),
+            nn.BatchNorm2d(16),
             nn.GELU(),
-            nn.MaxPool1d(2),  # T -> T/2
+            nn.MaxPool2d(kernel_size=(1, 2)),  # riduce T di 2
 
-            nn.Conv1d(32, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
+            # Block 2
+            nn.Conv2d(16, 32, kernel_size=(3, 7), padding=(1, 3)),
+            nn.BatchNorm2d(32),
             nn.GELU(),
-            nn.MaxPool1d(2),  # T -> T/4
+            nn.MaxPool2d(kernel_size=(2, 2)),  # riduce lead e T
 
-            nn.Conv1d(64, 128, kernel_size=7, padding=3),
-            nn.BatchNorm1d(128),
+            # Block 3
+            nn.Conv2d(32, 64, kernel_size=(3, 7), padding=(1, 3)),
+            nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.MaxPool1d(2),  # T -> T/8
+            nn.MaxPool2d(kernel_size=(2, 2)),  # riduce ancora
         )
 
-        # GRU bidirezionale sul tempo
-        self.gru = nn.GRU(
-            input_size=128,
-            hidden_size=hidden_size,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
+        # Global Average Pooling 2D -> (B, 64)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # FC per portare a out_dim
+        self.fc = nn.Linear(64, out_dim)
 
     def forward(self, x):
         """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Shape (B, 12, T_segment)
-
-        Returns
-        -------
-        h_flat : torch.Tensor
-            Shape (B, 2*hidden_size)
+        x: (B, 1, 12, T)
         """
-        # CNN 1D
-        x = self.conv_block(x)   # (B, 128, T')
-        # Permuta a (B, T', C) per la GRU
-        x = x.permute(0, 2, 1)   # (B, T', 128)
-
-        # GRU
-        # output: (B, T', 2*hidden_size)
-        # h: (num_layers*2, B, hidden_size) -> ultima hidden state per direzione
-        _, h = self.gru(x)
-
-        # h ha shape (2, B, hidden_size) dato num_layers=1, bidirectional=True
-        h = h.permute(1, 0, 2).reshape(x.size(0), -1)  # (B, 2*hidden_size)
-        return h
+        x = self.features(x)                # (B, 64, H', W')
+        x = self.global_pool(x)             # (B, 64, 1, 1)
+        x = x.view(x.size(0), -1)           # (B, 64)
+        x = self.fc(x)                      # (B, out_dim)
+        x = F.gelu(x)
+        return x
 
 
-class TabularBranch(nn.Module):
+class ECG2DModel3(nn.Module):
     """
-    Ramo MLP per le feature tabellari.
+    Opzione 3: SOLO ECG 2D, senza tabellare.
+
+    Input:  immagini ECG (B, 1, 12, T)
+    Output: probabilità sport_ability
     """
 
-    def __init__(self, in_features, hidden_dim=32):
+    def __init__(self, ecg_out_dim=256, dropout=0.3):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(in_features, 32),
-            nn.GELU(),
-            nn.Linear(32, hidden_dim),
-            nn.GELU()
-        )
-
-    def forward(self, x):
-        """
-        x: (B, in_features)
-        return: (B, hidden_dim)
-        """
-        return self.net(x)
-
-
-class ECGSportAbilityModel(nn.Module):
-    """
-    Modello multimodale:
-      - ECGBackbone: embedding ECG (2*ecg_hidden)
-      - TabularBranch: embedding tabellare (tab_hidden)
-      - Classifier: MLP finale che concatena le due embedding
-    Output: probabilità di sport_ability = 1
-    """
-
-    def __init__(self, tab_in_features, ecg_hidden=128, tab_hidden=32, dropout=0.3):
-        super().__init__()
-
-        self.ecg_backbone = ECGBackbone(in_channels=12, hidden_size=ecg_hidden)
-        self.tab_branch   = TabularBranch(in_features=tab_in_features, hidden_dim=tab_hidden)
-
-        fusion_dim = 2 * ecg_hidden + tab_hidden
+        self.ecg_backbone = ECG2DBackbone(out_dim=ecg_out_dim)
 
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
+            nn.Linear(ecg_out_dim, 128),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(128, 1)
         )
+
+    def forward(self, ecg_img):
+        ecg_emb = self.ecg_backbone(ecg_img)  # (B, ecg_out_dim)
+        logits = self.classifier(ecg_emb)
+        prob = torch.sigmoid(logits)
+        return prob
 
     def forward(self, tab, ecg):
         """
@@ -999,20 +960,25 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
             [X_test_imputed[numeric_cols], X_test_imputed[categorical_cols]], axis=1
         )
 
-        # Creo Dataset e DataLoader
-        train_dataset = ECGDataset(train_final_df, ecg_train_segments, Y_train)
-        test_dataset  = ECGDataset(test_final_df,  ecg_test_segments,  Y_test)
+        # Dataset & DataLoader (2D)
+        train_dataset = ECG2DDataset(train_final_df, ecg_train_segments, Y_train)
+        test_dataset  = ECG2DDataset(test_final_df,  ecg_test_segments,  Y_test)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
-        # Inizializzo il modello per questo fold
-        tab_in_features = train_final_df.shape[1]  # numero di colonne tabellari
-        model = ECGSportAbilityModel(tab_in_features=tab_in_features).to(device)
+        # Modello 3+5
+        tab_in_features = train_final_df.shape[1]
+        model = ECG2DModel3Plus5(
+            tab_in_features=tab_in_features,
+            ecg_out_dim=256,
+            tab_hidden=32,
+            dropout=0.3
+        ).to(device)
 
-        # Uso BCE con probabilità (il modello ha già la sigmoid)
         criterion = nn.BCELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
 
         # Per salvare metriche per epoca (dentro il singolo fold)
         f1_list_single_fold = []
