@@ -18,11 +18,11 @@ def preprocess_data(df):
 
     # One-Hot Encoding for 'training_load'
     if 'training_load' in df.columns:
-        # Create dummies for 1, 2, 3
-        # Assuming training_load contains values like 1, 2, 3
+        # Create dummies for 1, 2, 3, 4
+        # Assuming training_load contains values like 1, 2, 3, 4
         dummies = pd.get_dummies(df['training_load'], prefix='training_load')
-        # Ensure we have all 3 columns even if some values are missing in one batch
-        for i in [1, 2, 3]:
+        # Ensure we have all 4 columns even if some values are missing in one batch
+        for i in [1, 2, 3, 4]:
             col_name = f'training_load_{i}'
             if col_name not in dummies.columns:
                 dummies[col_name] = 0
@@ -59,6 +59,29 @@ def visualize_comparison(v1, v2, name1, name2, col_name):
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.show()
     plt.close()
+
+def visualize_sport_classification(df, col_name, target_col='sport_ability'):
+    """
+    Visualizes the distribution of a column split by sport_classification (0 vs 1).
+    """
+    plt.figure(figsize=(10, 6))
+    
+    # Check if target column exists
+    if target_col not in df.columns:
+        return
+
+    # Use histplot with multiple="stack" or "dodge"
+    # "stack" shows the total count and how it's divided
+    # "dodge" shows them side-by-side
+    sns.histplot(data=df, x=col_name, hue=target_col, multiple="stack", element="step", palette="viridis")
+    
+    plt.title(f"Distribution of {col_name} by {target_col}")
+    plt.xlabel(col_name)
+    plt.ylabel("Count")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+    plt.close()
+
 
 def analyze_excel_files(data_dir):
     # Find all Excel files in the Data directory, filtering out temporary ones (~$...)
@@ -114,11 +137,31 @@ def analyze_excel_files(data_dir):
         else:
             print("No common numeric columns found to compare.")
 
+        # Sport Classification Analysis
+        print(f"\n{'='*50}")
+        print(f"Sport Classification Analysis (Combined Data)")
+        print(f"{'='*50}")
+        
+        # Combine dataframes for this analysis to see overall patterns
+        df_total = pd.concat([df1, df2], ignore_index=True)
+        
+        target_col = 'sport_ability'
+        if target_col in df_total.columns:
+            # Analyze against all other numeric columns
+            numeric_cols = df_total.select_dtypes(include=['number']).columns
+            for col in numeric_cols:
+                if col != target_col:
+                    visualize_sport_classification(df_total, col, target_col)
+        else:
+            print(f"Column '{target_col}' not found in the combined dataset.")
+
+    except PermissionError:
+        print("\nERROR: Permission denied. Please close any open Excel files and try again.")
     except Exception as e:
         import traceback
         print(f"Error during analysis: {e}")
         traceback.print_exc()
 
 if __name__ == "__main__":
-    data_folder = "Data"
+    data_folder = r"C:\Users\Marco\OneDrive - Politecnico di Milano\Desktop\Dottorato\Corsi\AI METHODS FOR BIOENGINEERING\ecg_challenge\Data"
     analyze_excel_files(data_folder)
