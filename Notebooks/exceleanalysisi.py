@@ -9,28 +9,41 @@ def preprocess_data(df):
     Cleans the DataFrame by removing specific columns and performing One-Hot Encoding.
     """
     # Columns to remove
+    # NOTE: ECG_patient_id is KEPT here for later balancing, and removed afterwards
     cols_to_drop = [
-        'code', 'ECG_patient_id', 'AV block', 'ST abnormality', 
+        'code', 'AV block', 'ST abnormality', 
         'Complete BBB', 'Prolonged QTc', 'Supraventricular arrhythmias', 
         'Ventricular arrhythmias', 'Baseline ECG abnormalities'
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
 
+    # Fix typo in column name if present
+    if 'trainning_load' in df.columns:
+        df = df.rename(columns={'trainning_load': 'training_load'})
+
     # One-Hot Encoding for 'training_load'
     if 'training_load' in df.columns:
-        # Create dummies for 1, 2, 3, 4
-        # Assuming training_load contains values like 1, 2, 3, 4
-        dummies = pd.get_dummies(df['training_load'], prefix='training_load')
-        # Ensure we have all 4 columns even if some values are missing in one batch
-        for i in [1, 2, 3, 4]:
+        # Convert to numeric, handle NaNs, and convert to integer
+        # We fill NaNs with -1 so they don't interfere with 0-4 classes, then cast to int
+        temp_load = pd.to_numeric(df['training_load'], errors='coerce').fillna(-1).astype(int)
+        
+        # Create dummies
+        dummies = pd.get_dummies(temp_load, prefix='training_load')
+        
+        # Ensure we have columns for 0, 1, 2, 3, 4
+        required_classes = [0, 1, 2, 3, 4]
+        selected_cols = []
+        
+        for i in required_classes:
             col_name = f'training_load_{i}'
             if col_name not in dummies.columns:
                 dummies[col_name] = 0
             # Convert to int (0/1) instead of bool
             dummies[col_name] = dummies[col_name].astype(int)
+            selected_cols.append(col_name)
         
         # Select only the columns we want in the specific order
-        dummies = dummies[['training_load_1', 'training_load_2', 'training_load_3']]
+        dummies = dummies[selected_cols]
         
         # Concatenate and drop original
         df = pd.concat([df.drop(columns=['training_load']), dummies], axis=1)
@@ -82,6 +95,55 @@ def visualize_sport_classification(df, col_name, target_col='sport_ability'):
     plt.show()
     plt.close()
 
+def balance_dataset(df, target_col='sport_ability', id_col='ECG_patient_id', random_state=42):
+    """
+    Balances the dataset by undersampling the majority class in 'target_col'.
+    Returns:
+        balanced_df (pd.DataFrame): The balanced dataset (with id_col REMOVED).
+        removed_ids (list): List of IDs from the removed rows.
+    """
+    if target_col not in df.columns:
+        print(f"Warning: {target_col} not found. Returning original df.")
+        return df, []
+    
+    if id_col not in df.columns:
+        print(f"Warning: {id_col} not found. Returning original df.")
+        return df, []
+
+    # Identify classes
+    counts = df[target_col].value_counts()
+    if len(counts) < 2:
+        print("Warning: Only one class present. Cannot balance.")
+        return df, []
+        
+    minority_class = counts.idxmin()
+    majority_class = counts.idxmax()
+    
+    n_minority = counts[minority_class]
+    
+    df_minority = df[df[target_col] == minority_class]
+    df_majority = df[df[target_col] == majority_class]
+    
+    # Undersample majority
+    df_majority_downsampled = df_majority.sample(n=n_minority, random_state=random_state)
+    
+    # Identify removed rows
+    # We use the index to find which rows from df_majority were NOT selected
+    removed_indices = df_majority.index.difference(df_majority_downsampled.index)
+    removed_rows = df_majority.loc[removed_indices]
+    removed_ids = removed_rows[id_col].tolist()
+    
+    # Combine
+    balanced_df = pd.concat([df_majority_downsampled, df_minority])
+    
+    # Shuffle the result so classes aren't grouped
+    balanced_df = balanced_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    
+    # Drop the ID column from the final dataset as requested
+    balanced_df = balanced_df.drop(columns=[id_col])
+    print (balanced_df)
+    
+    return balanced_df, removed_ids
 
 def analyze_excel_files(data_dir):
     # Find all Excel files in the Data directory, filtering out temporary ones (~$...)
@@ -103,6 +165,11 @@ def analyze_excel_files(data_dir):
 
         # Preprocess both files
         print("Preprocessing DataFrames...")
+        
+        # Keep raw copies for the final inclusive analysis
+        df1_raw = df1.copy()
+        df2_raw = df2.copy()
+        
         df1 = preprocess_data(df1)
         df2 = preprocess_data(df2)
 
@@ -137,21 +204,52 @@ def analyze_excel_files(data_dir):
         else:
             print("No common numeric columns found to compare.")
 
-        # Sport Classification Analysis
+        # --- DATASET BALANCING ---
         print(f"\n{'='*50}")
-        print(f"Sport Classification Analysis (Combined Data)")
+        print(f"Dataset Balancing (Target: sport_ability)")
         print(f"{'='*50}")
         
-        # Combine dataframes for this analysis to see overall patterns
-        df_total = pd.concat([df1, df2], ignore_index=True)
+        # Balance df1
+        print(f"Balancing {name1}...")
+        df1_balanced, removed_ids1 = balance_dataset(df1)
+        print(f"Removed {len(removed_ids1)} patients from {name1}.")
+        # print(f"Sample removed IDs: {removed_ids1[:5]} ...")
+        
+        # Balance df2
+        print(f"Balancing {name2}...")
+        df2_balanced, removed_ids2 = balance_dataset(df2)
+        print(f"Removed {len(removed_ids2)} patients from {name2}.")
+        
+        # Verify Balanced Dataset
+        print(f"\n{'='*50}")
+        print(f"Verification of BALANCED Datasets")
+        print(f"{'='*50}")
+        
+        for df_b, name in [(df1_balanced, name1), (df2_balanced, name2)]:
+            print(f"-- {name} Balanced --")
+            print(f"Shape: {df_b.shape}")
+            if 'sport_ability' in df_b.columns:
+                print(f"sport_ability Distribution:\n{df_b['sport_ability'].value_counts()}")
+            print(f"Columns: {list(df_b.columns)}")
+            print("First 10 rows:")
+            print(df_b.head(10))
+            print("-" * 30)
+
+        # Sport Ability Analysis (Combined Data - ALL COLUMNS)
+        print(f"\n{'='*50}")
+        print(f"Sport Ability Analysis (Combined Data - All Columns)")
+        print(f"{'='*50}")
+        
+        # Combine RAW dataframes for this analysis to include dropped columns
+        df_total_raw = pd.concat([df1_raw, df2_raw], ignore_index=True)
         
         target_col = 'sport_ability'
-        if target_col in df_total.columns:
-            # Analyze against all other numeric columns
-            numeric_cols = df_total.select_dtypes(include=['number']).columns
+        if target_col in df_total_raw.columns:
+            # Analyze against all numeric columns in the RAW data
+            numeric_cols = df_total_raw.select_dtypes(include=['number']).columns
             for col in numeric_cols:
                 if col != target_col:
-                    visualize_sport_classification(df_total, col, target_col)
+                    visualize_sport_classification(df_total_raw, col, target_col)
         else:
             print(f"Column '{target_col}' not found in the combined dataset.")
 
