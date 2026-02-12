@@ -851,7 +851,7 @@ class ECGSportAbilityModel(nn.Module):
     Output: probabilità di sport_ability = 1
     """
 
-    def __init__(self, tab_in_features, ecg_hidden=128, tab_hidden=32, dropout=0.3):
+    def __init__(self, tab_in_features, ecg_hidden=128, tab_hidden=32, dropout=0.5):
         super().__init__()
 
         self.ecg_backbone = ECGBackbone(in_channels=12, hidden_size=ecg_hidden)
@@ -888,12 +888,85 @@ class ECGSportAbilityModel(nn.Module):
         prob = torch.sigmoid(logits)              # Sigmoid per avere probabilità
         return prob
 
+class EarlyStopping:
+    """
+    Early stops the training if validation loss doesn't improve after a given patience.
+    """
+    def __init__(self, patience=10, min_delta=0):
+        """
+        Args:
+            patience (int): How many epochs to wait after last time validation loss improved.
+            min_delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
 
 ###############################################
 # TRAINING + CROSS-VALIDATION
 ###############################################
 
-def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_splits=10, threshold=0.5):
+def plot_cumulative_confusion_matrix(all_y_true, all_y_pred, class_names=['Not Eligible', 'Eligible']):
+    """
+    Plots a confusion matrix summed across all cross-validation folds.
+
+    Parameters
+    ----------
+    all_y_true : list or np.array
+        List containing all ground truth labels concatenated from all folds.
+    all_y_pred : list or np.array
+        List containing all binary predictions concatenated from all folds.
+    class_names : list
+        List of class names for the axis labels.
+    """
+    # Calculate the confusion matrix
+    cm = confusion_matrix(all_y_true, all_y_pred)
+    
+    # Calculate percentages for annotation
+    cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+
+    # Create labels for each cell
+    group_counts = [f"{value:0.0f}" for value in cm.flatten()]
+    group_percentages = [f"{value:.1f}%" for value in cm_percent.flatten()]
+    
+    labels = [f"{v1}\n({v2})" for v1, v2 in zip(group_counts, group_percentages)]
+    labels = np.asarray(labels).reshape(2, 2)
+
+    # Plotting
+    plt.figure(figsize=(8, 6))
+    
+    # Using a blue colormap to match your 'clean' signal style
+    sns.heatmap(
+        cm, 
+        annot=labels, 
+        fmt='', 
+        cmap='Blues', 
+        cbar=False,
+        xticklabels=class_names,
+        yticklabels=class_names,
+        annot_kws={"size": 14, "weight": "bold"}
+    )
+    
+    plt.title('Cumulative Confusion Matrix (All Folds)', fontsize=16, pad=20)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_splits=5, threshold=0.5, patience=15):
     """
     Esegue cross-validation stratificata sul target 'sport_ability'
     usando il modello ECGSportAbilityModel.
@@ -932,6 +1005,10 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
     train_loss_max = []
     test_loss_max = []
     epochs_all_fold = []
+
+    # Global storage for the best predictions across all folds
+    global_y_true = []
+    global_y_pred = []
 
     # Stratified K-Fold su sport_ability
     strat_kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -1014,6 +1091,9 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
         criterion = nn.BCELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+        # --- INITIALIZE EARLY STOPPING FOR THIS FOLD ---
+        early_stopping = EarlyStopping(patience=patience, min_delta=0.0001)
+
         # Per salvare metriche per epoca (dentro il singolo fold)
         f1_list_single_fold = []
         f1_list_single_fold_train = []
@@ -1030,6 +1110,7 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
         train_loss_single_fold = []
         test_loss_single_fold = []
         epochs_single_fold = []
+        fold_predictions_history = []
 
         # Loop di training per epoche
         for epoch in tqdm(range(num_epochs), desc=f"Fold {fold_idx+1}/{n_splits}"):
@@ -1117,6 +1198,10 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
                     all_preds_test.extend(preds)
                     all_labels_test.extend(labs)
 
+            # Store predictions for this epoch temporarily
+            epoch_y_true = all_labels_test.copy()
+            epoch_y_pred = all_preds_test.copy()
+
             avg_test_loss = test_loss / len(test_loader)
             test_loss_single_fold.append(avg_test_loss)
 
@@ -1144,6 +1229,16 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
             )
             print(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
 
+            # Save these lists into a temporary history for the current fold
+            fold_predictions_history.append((epoch_y_true, epoch_y_pred))
+
+            # --- CHECK EARLY STOPPING ---
+            early_stopping(avg_test_loss)
+            
+            if early_stopping.early_stop:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break # Break out of the epoch loop
+
         # Seleziono l'epoca con F1 massima sul test per questo fold
         max_f1 = max(f1_list_single_fold)
         max_f1_index = f1_list_single_fold.index(max_f1)
@@ -1165,6 +1260,13 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
         train_loss_all_folds.append(train_loss_single_fold)
         train_loss_max.append(train_loss_single_fold[max_f1_index])
         epochs_all_fold.append(epochs_single_fold[max_f1_index])
+
+        # After the loop, retrieve the predictions from the best epoch
+        best_epoch_data = fold_predictions_history[max_f1_index]
+        global_y_true.extend(best_epoch_data[0])
+        global_y_pred.extend(best_epoch_data[1])
+
+    plot_cumulative_confusion_matrix(global_y_true, global_y_pred)
 
     ###################################
     # REPORT FINALE SU TUTTI I FOLD
@@ -1271,8 +1373,9 @@ print(f"Total samples in signals: {n_tot_signals}")
 train_and_evaluate(
     signals=signals,
     tabular_data=tabular_data_balanced,
-    num_epochs=5,        # aumenta es. a 30–50 quando tutto funziona
+    num_epochs=100,        # aumenta es. a 30–50 quando tutto funziona
     batch_size=32,
     n_splits=10,
-    threshold=0.5        # puoi ottimizzarla in seguito
+    threshold=0.6,        # puoi ottimizzarla in seguito
+    patience=5
 )
