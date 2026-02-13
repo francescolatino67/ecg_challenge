@@ -712,6 +712,56 @@ def segment_ecg(signals, segment_length=2500, start_mode="begin"):
 
     return segments
 
+def segment_ecg_sliding_window(signals, segment_length=2500, step=500):
+    """
+    Segments ECG signals using a sliding window approach with overlap.
+    
+    Parameters
+    ----------
+    signals : np.ndarray
+        Shape (N_patients, T, 12)
+        Input signals.
+    segment_length : int
+        Length of each window (in samples).
+    step : int
+        Stride of the window. 
+        - If step == segment_length, there is no overlap.
+        - If step < segment_length, windows overlap by (segment_length - step).
+        
+    Returns
+    -------
+    segments : np.ndarray
+        Shape (N_total_segments, segment_length, 12)
+        All segments from all patients stacked along the first dimension.
+    patient_ids : np.ndarray
+        Shape (N_total_segments,)
+        Array tracking which patient ID (index 0 to N-1) each segment belongs to.
+        Useful for grouped cross-validation or voting later.
+    """
+    N, T, C = signals.shape
+    
+    # Calculate how many segments we can fit per patient
+    if T < segment_length:
+        raise ValueError(f"Signal length {T} is smaller than segment length {segment_length}.")
+        
+    # Number of windows per signal = (Total - Window) // Step + 1
+    num_windows = (T - segment_length) // step + 1
+    
+    all_segments = []
+    patient_indices = []
+
+    for i in range(N):
+        for w in range(num_windows):
+            start = w * step
+            end = start + segment_length
+            
+            # Extract segment
+            seg = signals[i, start:end, :]
+            all_segments.append(seg)
+            patient_indices.append(i) # Store index of the patient
+
+    return np.array(all_segments), np.array(patient_indices)
+
 ###############################################
 # DATASET PYTORCH
 ###############################################
@@ -890,30 +940,47 @@ class ECGSportAbilityModel(nn.Module):
 
 class EarlyStopping:
     """
-    Early stops the training if validation loss doesn't improve after a given patience.
+    Early stops the training if the monitored metric doesn't improve.
+    Supports both 'min' (for Loss) and 'max' (for AUROC/Accuracy).
     """
-    def __init__(self, patience=10, min_delta=0):
+    def __init__(self, patience=10, min_delta=0, mode='min'):
         """
         Args:
-            patience (int): How many epochs to wait after last time validation loss improved.
-            min_delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+            patience (int): Epochs to wait after best metric.
+            min_delta (float): Minimum change to qualify as improvement.
+            mode (str): 'min' for Loss, 'max' for AUROC/Accuracy.
         """
         self.patience = patience
         self.min_delta = min_delta
+        self.mode = mode
         self.counter = 0
-        self.best_loss = None
+        self.best_score = None
         self.early_stop = False
+        
+        # Set comparison function based on mode
+        if mode == 'min':
+            self.monitor_op = np.less
+            self.best_score = np.inf
+        elif mode == 'max':
+            self.monitor_op = np.greater
+            self.best_score = -np.inf
+        else:
+            raise ValueError(f"Mode {mode} not recognized. Use 'min' or 'max'.")
 
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
+    def __call__(self, current_score):
+        # Check if current score is better than best score by at least min_delta
+        if self.mode == 'min':
+            improved = self.monitor_op(current_score, self.best_score - self.min_delta)
+        else:
+            improved = self.monitor_op(current_score, self.best_score + self.min_delta)
+
+        if improved:
+            self.best_score = current_score
+            self.counter = 0
+        else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
 
 ###############################################
 # TRAINING + CROSS-VALIDATION
@@ -942,7 +1009,7 @@ def plot_cumulative_confusion_matrix(all_y_true, all_y_pred, class_names=['Not E
     group_counts = [f"{value:0.0f}" for value in cm.flatten()]
     group_percentages = [f"{value:.1f}%" for value in cm_percent.flatten()]
     
-    labels = [f"{v1}\n({v2})" for v1, v2 in zip(group_counts, group_percentages)]
+    labels = [f"{v1}" for v1, v2 in zip(group_counts, group_percentages)]
     labels = np.asarray(labels).reshape(2, 2)
 
     # Plotting
@@ -957,14 +1024,29 @@ def plot_cumulative_confusion_matrix(all_y_true, all_y_pred, class_names=['Not E
         cbar=False,
         xticklabels=class_names,
         yticklabels=class_names,
-        annot_kws={"size": 14, "weight": "bold"}
+        annot_kws={"size": 18, "weight": 'bold'}
     )
     
-    plt.title('Cumulative Confusion Matrix (All Folds)', fontsize=16, pad=20)
-    plt.ylabel('True Label', fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=12)
+    # plt.title('Cumulative Confusion Matrix (All Folds)', fontsize=16, pad=20)
+    plt.ylabel('True Label', fontsize=14)
+    plt.xlabel('Predicted Label', fontsize=14)
     plt.tight_layout()
     plt.show()
+
+def save_mean_roc_to_csv(mean_fpr, mean_tpr, filename="mean_roc_curve.csv"):
+    """
+    Saves the Mean ROC curve data (FPR and TPR) to a CSV file.
+    """
+    # Create a DataFrame
+    df_roc = pd.DataFrame({
+        'Mean_FPR': mean_fpr,
+        'Mean_TPR': mean_tpr
+    })
+    
+    # Save to CSV
+    output_path = os.path.join(ROOT_PATH, filename)
+    df_roc.to_csv(output_path, index=False)
+    print(f"\nMean ROC curve data saved to: {output_path}")
 
 def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_splits=5, threshold=0.5, patience=15):
     """
@@ -1019,82 +1101,92 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
     ):
         print(f"\n====================== Fold {fold_idx + 1}/{n_splits} ======================\n")
 
-        # Split tabellare
-        X_train = tabular_data.iloc[train_index, :].copy()
-        X_test  = tabular_data.iloc[test_index, :].copy()
+        # 1. Split base (Patient Level)
+        X_train_raw = tabular_data.iloc[train_index, :].copy()
+        X_test_raw  = tabular_data.iloc[test_index, :].copy()
 
-        # Split segnali
-        ecg_train = signals[train_index, :, :]  # (N_train, T, 12)
-        ecg_test  = signals[test_index, :, :]   # (N_test,  T, 12)
+        ecg_train_raw = signals[train_index, :, :]  # (N_train, T, 12)
+        ecg_test_raw  = signals[test_index, :, :]   # (N_test,  T, 12)
+        
+        Y_train_raw = X_train_raw["sport_ability"]
+        Y_test_raw  = X_test_raw["sport_ability"]
 
-        # Segmentazione ECG (puoi cambiare segment_length)
-        segment_length = 2500
-        ecg_train_segments = segment_ecg(ecg_train, segment_length=segment_length, start_mode="begin")
-        ecg_test_segments  = segment_ecg(ecg_test,  segment_length=segment_length, start_mode="begin")
+        # 2. SLIDING WINDOW SEGMENTATION
+        # Train: Overlap for augmentation (step < segment_length)
+        # Test:  No Overlap for evaluation (step = segment_length) or strict Center Crop
+        segment_len = 1000
+        
+        # Train: 50% overlap (step=1250) -> Doubles/Triples training data
+        ecg_train_segs, train_pidx = segment_ecg_sliding_window(
+            ecg_train_raw, segment_length=segment_len, step=500
+        )
+        
+        # Test: No overlap (step=1000) to avoid redundant evaluation of the same patient
+        ecg_test_segs, test_pidx = segment_ecg_sliding_window(
+            ecg_test_raw,  segment_length=segment_len, step=1000
+        )
+        
+        print(f"Train Segments: {ecg_train_segs.shape[0]} (from {len(train_index)} patients)")
+        print(f"Test Segments:  {ecg_test_segs.shape[0]} (from {len(test_index)} patients)")
 
-        # Target
-        Y_train = X_train["sport_ability"]
-        Y_test  = X_test["sport_ability"]
-
-        # Seleziona le colonne che vuoi usare come feature tabellari
-        # In questo esempio uso: age_at_exam, height, weight, trainning_load, sex, sport_classification
+        # 3. Preprocessing Tabulare (Imputation/Scaling) su dati PAZIENTE (più efficiente)
         feature_cols = tabular_data.columns.difference(["ECG_patient_id", "sport_ability"])
-        print(feature_cols)
-        X_train_final = X_train[feature_cols].copy()
-        X_test_final  = X_test[feature_cols].copy()
+        X_train_final = X_train_raw[feature_cols].copy()
+        X_test_final  = X_test_raw[feature_cols].copy()
 
-        # Pulizia semplice su age_at_exam e trainning_load (come nel notebook)
+        # Pulizia
         for df in [X_train_final, X_test_final]:
             df["age_at_exam"] = df["age_at_exam"].apply(lambda x: x if 0.0 <= x <= 100.0 else np.nan)
-            # df["trainning_load"] = df["trainning_load"].apply(lambda x: x if 0 < x <= 4 else np.nan)
 
-        # Imputazione dei NaN (IterativeImputer)
+        # Imputazione
         imputer = IterativeImputer(random_state=42)
         X_train_imputed = pd.DataFrame(imputer.fit_transform(X_train_final), columns=feature_cols)
         X_test_imputed  = pd.DataFrame(imputer.transform(X_test_final), columns=feature_cols)
 
-        # Definisco quali colonne sono numeriche e quali "categoriche"
+        # Scaling
         numeric_cols = ["age_at_exam", "height", "weight"]
         categorical_cols = [col for col in feature_cols if col not in numeric_cols]        
-
-        # Scaling sulle numeriche
         scaler = StandardScaler()
         X_train_imputed[numeric_cols] = scaler.fit_transform(X_train_imputed[numeric_cols])
         X_test_imputed[numeric_cols]  = scaler.transform(X_test_imputed[numeric_cols])
 
-        # Piccola trasformazione per le categoriche se necessario
-        # (ad esempio mappare 0 a -1 se vogliamo distinguerlo da "missing")
+        # Categorical handling
         for col in categorical_cols:
             X_train_imputed[col] = X_train_imputed[col].apply(lambda x: -1 if x == 0 else x)
             X_test_imputed[col]  = X_test_imputed[col].apply(lambda x: -1 if x == 0 else x)
 
-        # DataFrame finale per PyTorch (concateno numeric + categorical nell'ordine che preferisco)
-        train_final_df = pd.concat(
-            [X_train_imputed[numeric_cols], X_train_imputed[categorical_cols]], axis=1
-        )
-        test_final_df = pd.concat(
-            [X_test_imputed[numeric_cols], X_test_imputed[categorical_cols]], axis=1
-        )
+        # 4. DATA EXPANSION (Align Tabular/Targets to Segments)
+        # Use the pidx (patient indices) to repeat the rows for the augmented segments
+        
+        # Train Expansion
+        X_train_expanded = pd.concat([
+            X_train_imputed.iloc[train_pidx].reset_index(drop=True)[numeric_cols],
+            X_train_imputed.iloc[train_pidx].reset_index(drop=True)[categorical_cols]
+        ], axis=1)
+        Y_train_expanded = Y_train_raw.values[train_pidx]
 
-        # Creo Dataset e DataLoader
-        train_dataset = ECGDataset(train_final_df, ecg_train_segments, Y_train)
-        test_dataset  = ECGDataset(test_final_df,  ecg_test_segments,  Y_test)
+        # Test Expansion
+        X_test_expanded = pd.concat([
+            X_test_imputed.iloc[test_pidx].reset_index(drop=True)[numeric_cols],
+            X_test_imputed.iloc[test_pidx].reset_index(drop=True)[categorical_cols]
+        ], axis=1)
+        Y_test_expanded = Y_test_raw.values[test_pidx]
+
+        # 5. Create Datasets & Loaders
+        train_dataset = ECGDataset(X_train_expanded, ecg_train_segs, pd.Series(Y_train_expanded))
+        test_dataset  = ECGDataset(X_test_expanded,  ecg_test_segs,  pd.Series(Y_test_expanded))
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
-        # Inizializzo il modello per questo fold
-        tab_in_features = train_final_df.shape[1]  # numero di colonne tabellari
+        # Model Init
+        tab_in_features = X_train_expanded.shape[1]
         model = ECGSportAbilityModel(tab_in_features=tab_in_features).to(device)
-
-        # Uso BCE con probabilità (il modello ha già la sigmoid)
         criterion = nn.BCELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        early_stopping = EarlyStopping(patience=patience, min_delta=0.0001, mode='max')
 
-        # --- INITIALIZE EARLY STOPPING FOR THIS FOLD ---
-        early_stopping = EarlyStopping(patience=patience, min_delta=0.0001)
-
-        # Per salvare metriche per epoca (dentro il singolo fold)
+        # Fold Metric Storage
         f1_list_single_fold = []
         f1_list_single_fold_train = []
         sensitivity_list_single_fold = []
@@ -1112,37 +1204,27 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
         epochs_single_fold = []
         fold_predictions_history = []
 
-        # Loop di training per epoche
+        # Training Loop
         for epoch in tqdm(range(num_epochs), desc=f"Fold {fold_idx+1}/{n_splits}"):
-            ###################################
-            # FASE DI TRAINING
-            ###################################
+            # --- TRAIN ---
             model.train()
             train_loss = 0.0
-
             all_labels_train = []
             all_preds_train = []
             all_outputs_train = []
 
             for tab_batch, sig_batch, lab_batch in train_loader:
-                tab_batch = tab_batch.to(device)
-                sig_batch = sig_batch.to(device)
-                lab_batch = lab_batch.to(device)
-
+                tab_batch, sig_batch, lab_batch = tab_batch.to(device), sig_batch.to(device), lab_batch.to(device)
                 optimizer.zero_grad()
-                outputs = model(tab_batch, sig_batch)  # (B,1) probabilità
-
+                outputs = model(tab_batch, sig_batch)
                 loss = criterion(outputs, lab_batch)
                 loss.backward()
                 optimizer.step()
-
                 train_loss += loss.item()
 
-                # Conversione per metriche
                 probs = outputs.detach().cpu().numpy().ravel()
                 preds = (probs > threshold).astype(int)
                 labs  = lab_batch.detach().cpu().numpy().ravel().astype(int)
-
                 all_outputs_train.extend(probs)
                 all_preds_train.extend(preds)
                 all_labels_train.extend(labs)
@@ -1150,42 +1232,30 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
             avg_train_loss = train_loss / len(train_loader)
             train_loss_single_fold.append(avg_train_loss)
 
-            # Metriche train
-            train_accuracy = accuracy_score(all_labels_train, all_preds_train) * 100
+            # Train Metrics
+            train_acc = accuracy_score(all_labels_train, all_preds_train) * 100
             f1_train = f1_score(all_labels_train, all_preds_train)
             tn, fp, fn, tp = confusion_matrix(all_labels_train, all_preds_train).ravel()
-            sensitivity_train = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            specificity_train = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-            auc_score_train = roc_auc_score(all_labels_train, all_outputs_train)
+            sens_train = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            spec_train = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            auc_train = roc_auc_score(all_labels_train, all_outputs_train)
 
             f1_list_single_fold_train.append(f1_train)
-            sensitivity_list_single_fold_train.append(sensitivity_train)
-            specificity_list_single_fold_train.append(specificity_train)
-            accuracy_list_single_fold_train.append(train_accuracy)
-            auc_score_list_single_fold_train.append(auc_score_train)
+            sensitivity_list_single_fold_train.append(sens_train)
+            specificity_list_single_fold_train.append(spec_train)
+            accuracy_list_single_fold_train.append(train_acc)
+            auc_score_list_single_fold_train.append(auc_train)
 
-            print(f"\n[Fold {fold_idx+1}] Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}")
-            print(
-                f"Train Acc: {train_accuracy:.2f}% | F1: {f1_train:.4f} | "
-                f"Sens: {sensitivity_train:.4f} | Spec: {specificity_train:.4f} | AUC: {auc_score_train:.4f}"
-            )
-
-            ###################################
-            # FASE DI VALIDAZIONE
-            ###################################
+            # --- VALIDATION ---
             model.eval()
             test_loss = 0.0
-
             all_labels_test = []
             all_preds_test = []
             all_outputs_test = []
 
             with torch.no_grad():
                 for tab_batch, sig_batch, lab_batch in test_loader:
-                    tab_batch = tab_batch.to(device)
-                    sig_batch = sig_batch.to(device)
-                    lab_batch = lab_batch.to(device)
-
+                    tab_batch, sig_batch, lab_batch = tab_batch.to(device), sig_batch.to(device), lab_batch.to(device)
                     outputs = model(tab_batch, sig_batch)
                     loss = criterion(outputs, lab_batch)
                     test_loss += loss.item()
@@ -1193,53 +1263,50 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
                     probs = outputs.detach().cpu().numpy().ravel()
                     preds = (probs > threshold).astype(int)
                     labs  = lab_batch.detach().cpu().numpy().ravel().astype(int)
-
                     all_outputs_test.extend(probs)
                     all_preds_test.extend(preds)
                     all_labels_test.extend(labs)
 
-            # Store predictions for this epoch temporarily
             epoch_y_true = all_labels_test.copy()
             epoch_y_pred = all_preds_test.copy()
-
             avg_test_loss = test_loss / len(test_loader)
             test_loss_single_fold.append(avg_test_loss)
 
-            # Metriche test
-            test_accuracy = accuracy_score(all_labels_test, all_preds_test) * 100
+            # Test Metrics
+            test_acc = accuracy_score(all_labels_test, all_preds_test) * 100
             f1 = f1_score(all_labels_test, all_preds_test)
             tn, fp, fn, tp = confusion_matrix(all_labels_test, all_preds_test).ravel()
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-            auc_score = roc_auc_score(all_labels_test, all_outputs_test)
+            sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            auc = roc_auc_score(all_labels_test, all_outputs_test)
             fpr, tpr, _ = roc_curve(all_labels_test, all_outputs_test)
 
             f1_list_single_fold.append(f1)
-            sensitivity_list_single_fold.append(sensitivity)
-            specificity_list_single_fold.append(specificity)
-            accuracy_list_single_fold.append(test_accuracy)
-            auc_score_list_single_fold.append(auc_score)
+            sensitivity_list_single_fold.append(sens)
+            specificity_list_single_fold.append(spec)
+            accuracy_list_single_fold.append(test_acc)
+            auc_score_list_single_fold.append(auc)
             fpr_list_single_fold.append(fpr)
             tpr_list_single_fold.append(tpr)
             epochs_single_fold.append(epoch)
 
-            print(
-                f"Test Loss: {avg_test_loss:.4f} | Acc: {test_accuracy:.2f}% | "
-                f"F1: {f1:.4f} | Sens: {sensitivity:.4f} | Spec: {specificity:.4f} | AUC: {auc_score:.4f}"
-            )
-            print(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
+            print(f"[Fold {fold_idx+1}] Ep {epoch+1} | T.Loss: {avg_train_loss:.4f} | V.Loss: {avg_test_loss:.4f} | Val F1: {f1:.4f} | Val AUC: {auc:.4f}")
 
-            # Save these lists into a temporary history for the current fold
             fold_predictions_history.append((epoch_y_true, epoch_y_pred))
 
-            # --- CHECK EARLY STOPPING ---
-            early_stopping(avg_test_loss)
-            
-            if early_stopping.early_stop:
-                print(f"Early stopping triggered at epoch {epoch+1}")
-                break # Break out of the epoch loop
+            auc = roc_auc_score(all_labels_test, all_outputs_test)
 
-        # Seleziono l'epoca con F1 massima sul test per questo fold
+            print(f"Test Loss: {avg_test_loss:.4f} | Val AUC: {auc:.4f} ...")
+
+            # --- CHECK EARLY STOPPING ---
+            # Pass the AUC score instead of loss
+            early_stopping(auc)
+
+            if early_stopping.early_stop:
+                print(f"Early stopping triggered at epoch {epoch+1} (Best AUC: {early_stopping.best_score:.4f})")
+                break
+
+        # Best Epoch Selection (Max F1)
         max_f1 = max(f1_list_single_fold)
         max_f1_index = f1_list_single_fold.index(max_f1)
 
@@ -1261,7 +1328,6 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
         train_loss_max.append(train_loss_single_fold[max_f1_index])
         epochs_all_fold.append(epochs_single_fold[max_f1_index])
 
-        # After the loop, retrieve the predictions from the best epoch
         best_epoch_data = fold_predictions_history[max_f1_index]
         global_y_true.extend(best_epoch_data[0])
         global_y_pred.extend(best_epoch_data[1])
@@ -1344,6 +1410,26 @@ def train_and_evaluate(signals, tabular_data, num_epochs=5, batch_size=32, n_spl
     plt.title("ROC Curve per tutti i fold")
     plt.legend(loc="lower right")
     plt.show()
+
+    tprs = np.array(tprs)
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0 # Ensure the curve ends exactly at (1,1)
+    std_tpr = np.std(tprs, axis=0)
+    mean_auc = np.mean(aucs) # or auc(mean_fpr, mean_tpr)
+    std_auc = np.std(aucs)
+
+    # --- INSERT SAVING LOGIC HERE ---
+    save_mean_roc_to_csv(mean_fpr, mean_tpr, filename="mean_roc_curve_1plus5.csv")
+    # --------------------------------
+
+    plt.plot(
+        mean_fpr,
+        mean_tpr,
+        color="#E32947",
+        label=r"Mean ROC (AUC = %0.2f $\pm$ %0.2f)" % (mean_auc, std_auc),
+        lw=2,
+        alpha=0.8,
+    )
 
     ###################################
     # PLOT LEARNING CURVES (LOSS)
